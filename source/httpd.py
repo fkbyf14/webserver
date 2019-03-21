@@ -1,79 +1,88 @@
 #! /usr/bin/env python
 # -*- coding: utf-8 -*-
+import asynchat
+import asyncore
+import datetime
+import errno
 import logging
 import os
-import sys
-import threading
-import urlparse
-from BaseHTTPServer import HTTPServer, BaseHTTPRequestHandler
 import urllib2
 
-import time
 from optparse import OptionParser
 from socket import *
-from Queue import Queue
+
 
 DEFAULT_DOCUMENT_ROOT = r'./'
+OK = 200
+FORBIDDEN = 403
+NOT_FOUND = 404
+NOT_ALLOWED = 405
+CRLF = "\r\n"
 
 CODES = {
-    200: "OK",
-    403: "FORBIDDEN",
-    404: "NOT_FOUND",
-    405: "METHOD NOT ALLOWED"
+    OK: "OK",
+    FORBIDDEN: "FORBIDDEN",
+    NOT_FOUND: "NOT FOUND",
+    NOT_ALLOWED: "METHOD NOT ALLOWED",
 }
+
+MIME = {
+        '.html': 'text/html',
+        '.css': 'text/css',
+        '.js': 'text/javascript',
+        '.jpg': 'image/jpeg',
+        '.jpeg': 'image/jpeg',
+        '.png': 'image/png',
+        '.gif': 'image/gif',
+        '.swf': 'application/x-shockwave-flash',
+    }
+
 MAXLINE = 1024
 config = {
     "HTTPD": 'http:/'#/127.0.0.1:8080"
 }
 
 
-class LineTooLong(Exception):
-    def __init__(self, message):
-        self.message = message
+class HttpResponse(object):
+    def __init__(self, code, conn_state, content_type=None, content_len=0):
+        self.code = code
+        self.conn_state = conn_state
+        self.content_type = content_type
+        self.content_len = content_len
+        self.utc = datetime.utcnow()
+
+    def headers_form(self):
+        headers = ["HTTP/1.1 {0} {1}".format(self.code, CODES[self.code]),
+                   self.utc.strftime("Date: %a, %d %b %Y %H:%M:%S GMT"), "Server: OTUServer/1.0"]
+        if self.content_len is not None:
+            headers.append("Content-Length: %d" % self.content_len)
+        if self.content_type:
+            headers.append("Content-Type: %s" % self.content_type)
+        if self.conn_state:
+            headers.append("Connection: %s" % self.conn_state)
+
+        return CRLF.join(headers)
 
 
-class BadStatusLine(Exception):
-    def __init__(self, message):
-        self.message = message
+def form_response(req, root_dir):
+    file_path = root_dir #+...
+    logging.info("checking the local file %s", file_path)
 
+    if not os.path.isfile(root_dir):
+        logging.info("file doesn't exist")
+        return HttpResponse(NOT_FOUND, None)
+    if not os.access(root_dir, os.R_OK):
+        logging.info("... access denied")
+        return HttpResponse(FORBIDDEN, None)
 
-class HTTPResponse:
-
-    def __init__(self, sock, debuglevel=0, strict=0, method=None, buffering=False):
-        if buffering:
-            # The caller won't be using any sock.recv() calls, so buffering
-            # is fine and recommended for performance.
-            self.fp = sock.makefile('rb')
-        else:
-            # The buffer size is specified as zero, because the headers of
-            # the response are read with readline().  If the reads were
-            # buffered the readline() calls could consume some of the
-            # response, which make be read via a recv() on the underlying
-            # socket.
-            self.fp = sock.makefile('rb', 0)
-        self.debuglevel = debuglevel
-        self.strict = strict
-        self._method = method
-
-        self.msg = None
-
-    def read_request(self):
-        # Initialize with Simple-Response defaults
-        line = self.fp.readline(MAXLINE + 1)
-        if len(line) > MAXLINE:
-            raise LineTooLong("header line")
-        if self.debuglevel > 0:
-            print "reply:", repr(line)
-        if not line:
-            # Presumably, the server closed the connection before
-            # sending a valid response.
-            raise BadStatusLine(line)
-        try:
-            print "line is:", line
-            [method, URI, version] = line.split(None, 2)
-        except ValueError:
-            method, URI, version = "", "", ""
-        return method, URI, version
+    content_type = MIME[file_path]
+    content_len = os.stat(file_path).st_size
+    if req.method == "GET":
+        return HttpResponse(OK, fp, content_type, content_len)
+    elif req.method == "HEAD":
+        return HttpResponse(OK, None, content_type, content_len)
+    else:
+        return HttpResponse(NOT_ALLOWED, None)
 
 
 def download(URI, path, httpd_base_url, timeout=40):
@@ -100,74 +109,86 @@ def download(URI, path, httpd_base_url, timeout=40):
     return code
 
 
-class WebServer(object):
-    def __init__(self, config, options):
+class HttpRequest(object):
+    def __init__(self, method, fpath, version, headers):
+        self.method = method
+        self.version = version
+        self.headers = headers
+        self.rel_path = fpath
+        logging.info("Created %s", self)
+
+    def __str__(self):
+        return ("HttpRequest: {method}, {version}, {headers}, {path)".
+                format(method=self.method, version = self.version, headers=self.headers, path=self.rel_path))
+
+    def read_request(self, data):
+        lines = str(data).split(CRLF)
+        method, location, version = lines[0].split()
+        headers = {}
+        for s in lines[1:]:
+            header, value = s.split(": ", 1)
+            headers[header] = value
+        return HttpRequest(
+            method,
+            location,
+            version,
+            headers
+        )
+
+
+class RequestHandler(asynchat.async_chat):
+    def __init__(self, sock, addr, root_dir):
+        asynchat.async_chat.__init__(self, sock=sock)
+        self.root_dir = root_dir
+        self.buffer = []
+        self.set_terminator(CRLF + CRLF)
+        self.logger = logging.getLogger("handling req from %s" % (addr,))
+
+    def collect_incoming_data(self, data):
+        self.logger.info("collect incoming data", data)
+        self.buffer.append(data)
+
+    def found_terminator(self):
+        req = HttpRequest.read_request(self.buffer)
+        resp = form_response(req, self.root_dir)
+        download(req.rel_path, self.root_dir, config['HTTPD'])
+        self.push(resp.headers_form())
+
+
+class WebServer(asyncore.dispatcher):
+    def __init__(self, config, options, host, port):
         self.httpd_base_url = config["HTTPD"]
         self.workers_number = options.workers
-        self.documents_dir = options.root
-        self.q = Queue(maxsize=0)
-        self.bind_ip = 'localhost'
-        self.bind_port = 8080
-        self.server_sock = socket(AF_INET, SOCK_STREAM)
-        self.server_sock.setsockopt(SOL_SOCKET, SO_REUSEPORT, 1)
-        self.server_sock.bind((self.bind_ip, self.bind_port))
-        self.server_sock.listen(5)
-        print 'Listening on {}:{}'.format(self.bind_ip, self.bind_port)
+        self.doc_dir = options.root
 
-    def handle_client_connection(self, queue):
-        while not queue.empty():
-            client_socket = queue.get()  # fetch new work from the Queue
-            try:
-                clients_request = HTTPResponse(client_socket)
-                print 'Received {}'.format(clients_request)
-                method, uri, version = clients_request.read_request()
-                if not method: break
+        asyncore.dispatcher.__init__(self)
+        self.create_socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.set_reuse_addr()
+        self.bind(host, port)
+        self.listen(100)
 
-                if method == "GET" or method == "HEAD":
-                    _, filename = os.path.split(uri)
-                    path = os.path.join(os.path.dirname(self.documents_dir), "{0}{1}".format(filename, ".html"))
-                    code = download(uri, path, config["HTTPD"])
-                    if code in CODES:
-                        print "I send"
-                        request = version + " " + repr(code) + " " + CODES[code]
-                        client_socket.sendall(bytes(request))
-                else:
-                    request = version + " " + "405" + CODES.get(405)
-                    client_socket.sendall(bytes(request))
+    def handle_accept(self):
+        listening = self.accept()
+        if listening is not None:
+            client_sock, address = listening
+            logging.info('Accepted connection from {}'.format(repr(address)))
+            RequestHandler(client_sock, address, self.doc_dir)
 
-                client_socket.close()
-                queue.task_done()
-            except:
-                print "Unexpected error with URL:", sys.exc_info()
-
-        return True
-
-    def requests_handler(self):
-        while True:
-            for i in range(self.workers_number):
-                client_sock, address = self.server_sock.accept()
-                print 'Accepted connection from {}:{}'.format(address[0], address[1])
-                self.q.put(client_sock)
-                print 'Starting thread ', i
-                worker = threading.Thread(
-                    target=self.handle_client_connection,
-                    args=(self.q,)
-                )
-                worker.setDaemon(True)
-                worker.start()
-            # now we wait until the queue has been processed
-            self.q.join()
-            print 'All tasks completed.'
-
-
-if __name__ == "__main__":
+def main():
     op = OptionParser()
-    op.add_option("-w", "--workers", action="store", type=int, default=1)
+    op.add_option("-w", "--workers", action="store", type=int, default=10)
     op.add_option("-r", "--root", action="store", type="string", default=DEFAULT_DOCUMENT_ROOT)
     (opts, args) = op.parse_args()
 
+    logging.basicConfig(format='%(asctime)s %(levelname)s %(processName)s %(threadName)s %(message)s',
+                        level=logging.INFO)
+
     try:
         server = WebServer(config, opts)
-        server.requests_handler()
+        asyncore.loop()
     except KeyboardInterrupt:
         pass
+
+
+if __name__ == '__main__':
+    main()
