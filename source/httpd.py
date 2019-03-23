@@ -7,6 +7,7 @@ import errno
 import logging
 import os
 import urllib2
+import mimetypes
 
 from optparse import OptionParser
 from socket import *
@@ -44,9 +45,8 @@ config = {
 
 
 class HttpResponse(object):
-    def __init__(self, code, conn_state, content_type=None, content_len=0):
+    def __init__(self, code, content_type=None, content_len=0):
         self.code = code
-        self.conn_state = conn_state
         self.content_type = content_type
         self.content_len = content_len
         self.utc = datetime.utcnow()
@@ -58,15 +58,15 @@ class HttpResponse(object):
             headers.append("Content-Length: %d" % self.content_len)
         if self.content_type:
             headers.append("Content-Type: %s" % self.content_type)
-        if self.conn_state:
-            headers.append("Connection: %s" % self.conn_state)
+        #if self.conn_state:
+           # headers.append("Connection: %s" % self.conn_state)
 
         return CRLF.join(headers)
 
 
 def form_response(req, root_dir):
-    file_path = root_dir #+...
-    logging.info("checking the local file %s", file_path)
+    filename = root_dir #+...
+    logging.info("checking the local file %s", filename)
 
     if not os.path.isfile(root_dir):
         logging.info("file doesn't exist")
@@ -75,12 +75,12 @@ def form_response(req, root_dir):
         logging.info("... access denied")
         return HttpResponse(FORBIDDEN, None)
 
-    content_type = MIME[file_path]
-    content_len = os.stat(file_path).st_size
+    content_type = MIME[filename]  #mimetypes.guess_type(filename)
+    content_len = os.stat(filename).st_size
     if req.method == "GET":
-        return HttpResponse(OK, fp, content_type, content_len)
+        return HttpResponse(OK, content_type, content_len)
     elif req.method == "HEAD":
-        return HttpResponse(OK, None, content_type, content_len)
+        return HttpResponse(OK, content_type, content_len)
     else:
         return HttpResponse(NOT_ALLOWED, None)
 
